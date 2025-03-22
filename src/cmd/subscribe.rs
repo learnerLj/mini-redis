@@ -136,7 +136,12 @@ impl Subscribe {
                     let frame = match res? {
                         Some(frame) => frame,
                         // This happens if the remote client has disconnected.
-                        None => return Ok(())
+                        None => {
+                            subscriptions.keys().for_each(|channel_name| {
+                                db.unsubscribe(channel_name);
+                            });
+                            return Ok(())
+                        }
                     };
 
                     handle_command(
@@ -144,6 +149,7 @@ impl Subscribe {
                         &mut self.channels,
                         &mut subscriptions,
                         dst,
+                        db
                     ).await?;
                 }
                 _ = shutdown.recv() => {
@@ -207,6 +213,7 @@ async fn handle_command(
     subscribe_to: &mut Vec<String>,
     subscriptions: &mut StreamMap<String, Messages>,
     dst: &mut Connection,
+    db: &Db,
 ) -> crate::Result<()> {
     // A command has been received from the client.
     //
@@ -232,7 +239,7 @@ async fn handle_command(
 
             for channel_name in unsubscribe.channels {
                 subscriptions.remove(&channel_name);
-
+                db.unsubscribe(&channel_name);
                 let response = make_unsubscribe_frame(channel_name, subscriptions.len());
                 dst.write_frame(&response).await?;
             }

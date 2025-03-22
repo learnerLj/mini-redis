@@ -4,7 +4,7 @@ use tokio::time::{self, Duration, Instant};
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 /// A wrapper around a `Db` instance. This exists to allow orderly cleanup
 /// of the `Db` by signalling the background purge task to shut down when
@@ -65,7 +65,7 @@ struct State {
 
     /// The pub/sub key-space. Redis uses a **separate** key space for key-value
     /// and pub/sub. `mini-redis` handles this by using a separate `HashMap`.
-    pub_sub: HashMap<String, broadcast::Sender<Bytes>>,
+    pub_sub: HashMap<String, ChannelState>,
 
     /// Tracks key TTLs.
     ///
@@ -83,6 +83,13 @@ struct State {
     /// values drop. Setting this to `true` signals to the background task to
     /// exit.
     shutdown: bool,
+}
+
+#[derive(Debug)]
+struct ChannelState {
+    sender: broadcast::Sender<Bytes>,
+    receiver_count: usize,
+    last_activity: Instant,
 }
 
 /// Entry in the key-value store
@@ -222,6 +229,7 @@ impl Db {
     ///
     /// The returned `Receiver` is used to receive values broadcast by `PUBLISH`
     /// commands.
+    #[instrument(skip(self))]
     pub(crate) fn subscribe(&self, key: String) -> broadcast::Receiver<Bytes> {
         use std::collections::hash_map::Entry;
 
@@ -231,8 +239,14 @@ impl Db {
         // If there is no entry for the requested channel, then create a new
         // broadcast channel and associate it with the key. If one already
         // exists, return an associated receiver.
-        match state.pub_sub.entry(key) {
-            Entry::Occupied(e) => e.get().subscribe(),
+        match state.pub_sub.entry(key.clone()) {
+            Entry::Occupied(e) => {
+                let channel_state = e.into_mut();
+                channel_state.receiver_count += 1;
+                channel_state.last_activity = Instant::now();
+                debug!("add sub, count: {}", channel_state.receiver_count);
+                channel_state.sender.subscribe()
+            }
             Entry::Vacant(e) => {
                 // No broadcast channel exists yet, so create one.
                 //
@@ -245,8 +259,31 @@ impl Db {
                 // in old messages being dropped. This prevents slow consumers
                 // from blocking the entire system.
                 let (tx, rx) = broadcast::channel(1024);
-                e.insert(tx);
+                let channel_state = ChannelState {
+                    sender: tx,
+                    receiver_count: 1,
+                    last_activity: Instant::now(),
+                };
+                debug!("create sub, count: {}", channel_state.receiver_count);
+                e.insert(channel_state);
                 rx
+            }
+        }
+    }
+
+    /// Unsubscribe from a channel.
+    ///
+    /// If the receiver count reaches zero, the channel is removed from the
+    /// `pub_sub` map.
+    #[instrument(skip(self))]
+    pub(crate) fn unsubscribe(&self, key: &str) {
+        let mut state = self.shared.state.lock().unwrap();
+
+        if let Some(channel_state) = state.pub_sub.get_mut(key) {
+            channel_state.receiver_count -= 1;
+            debug!("remove sub, count: {}", channel_state.receiver_count);
+            if channel_state.receiver_count == 0 {
+                state.pub_sub.remove(key);
             }
         }
     }
@@ -262,7 +299,7 @@ impl Db {
             // On a successful message send on the broadcast channel, the number
             // of subscribers is returned. An error indicates there are no
             // receivers, in which case, `0` should be returned.
-            .map(|tx| tx.send(value).unwrap_or(0))
+            .map(|channel_state: &ChannelState| channel_state.sender.send(value).unwrap_or(0))
             // If there is no entry for the channel key, then there are no
             // subscribers. In this case, return `0`.
             .unwrap_or(0)

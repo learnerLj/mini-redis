@@ -12,6 +12,7 @@ use tokio::time::{self, Duration};
 #[tokio::test]
 async fn key_value_get_set() {
     let addr = start_server().await;
+    dbg!(addr);
 
     // Establish a connection to the server
     let mut stream = TcpStream::connect(addr).await.unwrap();
